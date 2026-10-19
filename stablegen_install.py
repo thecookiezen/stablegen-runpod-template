@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""Headless driver for StableGen's installer.py.
+
+StableGen's installer.py is an interactive menu script (it calls input()), so
+it cannot run unattended inside a RunPod boot. This driver imports it as a
+module and replays its per-item installation logic for a fixed set of package
+tags, keeping all of its hard-won behavior: pinned node handling, post-clone
+compat patches, comfy-env patch/reinstall dance, CUDA 12.4 install retry,
+flex_gemm triton patch, and resumable downloads.
+
+Run it with the ComfyUI venv interpreter so sys.executable (installer.py's
+fallback for find_comfyui_python) is the interpreter that runs install.py:
+
+    /workspace/runpod-slim/ComfyUI/.venv-cu128/bin/python \\
+        /opt/stablegen-template/stablegen_install.py /workspace/runpod-slim/ComfyUI
+
+Environment:
+    STABLEGEN_REPO   where installer.py lives (default /opt/stablegen)
+    STABLEGEN_TAGS   space-separated package tags to install (see below)
+
+Default tag set and approximate download volume onto the network volume:
+    core               IPAdapter Plus node + SDXL IPAdapter/CLIP vision models
+    preset_essentials  ControlNet depth SDXL
+    extended_optional  extra LoRAs + ControlNets
+    pbr_marigold       ComfyUI-Marigold node
+    pbr_stabledelight  ComfyUI_StableDelight_ll node + yoso-delight model
+    checkpoint_realvis RealVisXL V5.0 fp16 checkpoint
+    qwen_core          ComfyUI-GGUF node + Qwen Image Edit GGUF/VAE/encoder
+    trellis2           ComfyUI-TRELLIS2 node + CUDA env builds (GPU required)
+"""
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+STABLEGEN_REPO = Path(os.environ.get("STABLEGEN_REPO", "/opt/stablegen"))
+
+DEFAULT_TAGS = (
+    "core preset_essentials extended_optional "
+    "pbr_marigold pbr_stabledelight "
+    "checkpoint_realvis qwen_core trellis2"
+)
+
+
+def die(msg: str) -> None:
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        die("usage: stablegen_install.py <ComfyUI directory>")
+
+    comfyui_path = Path(sys.argv[1]).resolve()
+    if not comfyui_path.is_dir():
+        die(f"ComfyUI path '{comfyui_path}' not found.")
+    if not (comfyui_path / "models").is_dir() or not (comfyui_path / "custom_nodes").is_dir():
+        die(f"'{comfyui_path}' does not look like a ComfyUI directory "
+            f"(missing 'models' or 'custom_nodes').")
+
+    installer_py = STABLEGEN_REPO / "installer.py"
+    if not installer_py.is_file():
+        die(f"installer.py not found at {installer_py} (set STABLEGEN_REPO).")
+
+    sys.path.insert(0, str(STABLEGEN_REPO))
+    import installer  # noqa: E402  (path set above on purpose)
+
+    tags = [t for t in os.environ.get("STABLEGEN_TAGS", DEFAULT_TAGS).split() if t]
+    item_ids = sorted(installer.get_unique_item_ids_for_tags(tags))
+
+    print("=" * 60)
+    print("StableGen headless install")
+    print(f"  ComfyUI:    {comfyui_path}")
+    print(f"  Python:     {sys.executable}")
+    print(f"  installer:  {installer_py}")
+    print(f"  tags:       {' '.join(tags)}")
+    unknown = [t for t in tags if not any(
+        t in d.get("packages", []) for d in installer.DEPENDENCIES.values())]
+    if unknown:
+        die(f"unknown tag(s): {' '.join(unknown)}")
+    print(f"  components: {len(item_ids)}")
+    print("=" * 60)
+
+    # Same pre-flight as installer.main(): if comfy-env is already present in
+    # this interpreter, make sure all of its patches are applied before any
+    # install.py subprocess runs.
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", "import comfy_env"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            print("Detected existing comfy-env; ensuring patches are applied...")
+            installer._apply_all_comfy_env_patches(comfyui_path)
+    except Exception as e:  # pragma: no cover - defensive, matches installer.py
+        print(f"WARNING: could not check/patch existing comfy-env: {e}")
+
+    failures = []
+
+    # This block mirrors the per-item loop of installer.main() (the part after
+    # the interactive confirmation), including ordering of pip installs,
+    # patches, install.py execution and the comfy-env reinstall afterwards.
+    for item_id in item_ids:
+        d = installer.DEPENDENCIES.get(item_id)
+        if d is None:
+            continue
+        print()
+        print(f"--- Processing: {d['name']} ---")
+
+        try:
+            if d["type"] == "node":
+                target_full_path = comfyui_path / d["target_dir_relative"] / d["repo_name"]
+                installer.clone_git_repo(d, comfyui_path)
+                if d.get("pip_packages"):
+                    installer.install_pip_packages(d["pip_packages"], comfyui_path)
+                    # comfy-env patches must exist BEFORE install.py runs
+                    if any("comfy-env" in p for p in d["pip_packages"]):
+                        installer._apply_all_comfy_env_patches(comfyui_path)
+                if d.get("post_clone_patches"):
+                    installer.apply_post_clone_patches(d, comfyui_path)
+                if d.get("run_install_script"):
+                    installer.run_node_install_script(d, comfyui_path)
+                    installer._patch_flex_gemm_autotuner(target_full_path)
+                # install.py may have downgraded comfy-env via its
+                # requirements.txt; force ours back and re-patch.
+                if d.get("pip_packages") and any("comfy-env" in p for p in d["pip_packages"]):
+                    print("  Re-installing comfy-env (overriding node requirements.txt)...")
+                    installer.install_pip_packages(["comfy-env"], comfyui_path, force_reinstall=True)
+                    installer._apply_all_comfy_env_patches(comfyui_path)
+            elif d["type"] == "model":
+                installer.download_file(d, comfyui_path)
+            elif d["type"] == "hf_model":
+                installer.download_hf_model(d, comfyui_path)
+            else:
+                print(f"  WARNING: unknown dependency type '{d['type']}', skipped.")
+        except SystemExit as e:
+            # installer.py calls sys.exit(1) on some failures; surface it but
+            # keep installing the remaining components.
+            print(f"  FAILED (exit {e.code}) - continuing with remaining components")
+            failures.append(d["name"])
+        except Exception as e:
+            print(f"  FAILED: {e} - continuing with remaining components")
+            failures.append(d["name"])
+
+    print()
+    print("=" * 60)
+    if failures:
+        print("Completed with failures (re-run this script to retry):")
+        for name in failures:
+            print(f"  - {name}")
+        print("=" * 60)
+        return 1
+    print("All components processed successfully.")
+    print("=" * 60)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
