@@ -78,6 +78,23 @@ TRELLIS2_REF=<commit> ./build_and_push.sh ...
 The exact commits baked into an image are printed during the build and stored
 in `/opt/stablegen-template/BUILD_INFO` inside it.
 
+## Build and push (GitHub Actions)
+
+`.github/workflows/docker-image.yml` does the same thing from CI: it builds and
+pushes `<dockerhub-user>/stablegen-comfyui` on every push to `main` that touches
+`Dockerfile`, `start.sh` or `stablegen_install.py`, on `v*.*.*` tags
+(`v1.2.3` -> tags `1.2.3`, `1.2`, `sha-<commit>`), and on demand
+(**Run workflow**, with optional `BASE_TAG` / `COMFYUI_VERSION` /
+`STABLEGEN_REF` overrides).
+
+One-time repo setup (Settings -> Secrets and variables -> Actions):
+
+- Secret `DOCKERHUB_USERNAME`: your Docker Hub username.
+- Secret `DOCKERHUB_TOKEN`: a Docker Hub access token (hub.docker.com ->
+  Account Settings -> Security -> New Access Token, Read/Write scope).
+- Optional variable `DOCKERHUB_REPO`: a different Docker Hub repository;
+  default is `<dockerhub-username>/stablegen-comfyui`.
+
 ## Create the RunPod template
 
 1. RunPod console: **Save & New Template** (or edit an existing one).

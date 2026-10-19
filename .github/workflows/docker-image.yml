@@ -1,0 +1,187 @@
+# Build the StableGen RunPod image and push it to Docker Hub.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   DOCKERHUB_USERNAME  Docker Hub username (namespace owner)
+#   DOCKERHUB_TOKEN     Docker Hub access token (Read/Write)
+#
+# The image name defaults to <docker-hub-username>/stablegen-comfyui. Set the
+# DOCKERHUB_REPO repository *variable* to push somewhere else (namespace or
+# name) without editing this file.
+#
+# Runs:
+#   * push to main touching the image inputs -> tags: latest, main, sha-<commit>
+#   * tag push v1.2.3                        -> tags: 1.2.3, 1.2, sha-<commit>
+#   * workflow_dispatch                      -> same tags + build-arg overrides
+#
+# Build-arg overrides are only forwarded when explicitly provided; otherwise
+# the Dockerfile ARG defaults stay the single source of truth (same behavior
+# as ./build_and_push.sh). For an amd64-only build no QEMU is needed: the
+# GitHub-hosted runner already is amd64.
+
+name: docker-image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+    paths:
+      - Dockerfile
+      - start.sh
+      - stablegen_install.py
+      - .github/workflows/docker-image.yml
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: "BASE_TAG (runpod/comfyui tag). Empty = Dockerfile default."
+        required: false
+        default: ""
+      comfyui_version:
+        description: "COMFYUI_VERSION override. Empty = Dockerfile default."
+        required: false
+        default: ""
+      stablegen_ref:
+        description: "STABLEGEN_REF (StableGen commit/tag). Empty = Dockerfile default."
+        required: false
+        default: ""
+      extra_build_args:
+        description: "Extra --build-arg lines, one NAME=VALUE per line (e.g. TRELLIS2_REF=<sha>)."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      # The image needs ~15 GB on top of the runpod/comfyui base (see README).
+      # The runner ships tens of GB of toolchains we never use, and its default
+      # Docker data-root sits on a small root disk. Free both.
+      - name: Free disk space
+        run: |
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /usr/share/swift \
+            /usr/local/.ghc /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            /usr/lib/jvm \
+            /usr/share/miniconda
+
+          sudo systemctl stop docker docker.socket
+          sudo rm -rf /var/lib/docker
+          sudo mkdir -p /mnt/docker-data
+          cfg=/etc/docker/daemon.json
+          if [ -f "$cfg" ]; then
+            sudo jq --arg d /mnt/docker-data '. + {"data-root": $d}' "$cfg" | sudo tee "$cfg" > /dev/null
+          else
+            printf '{"data-root": "/mnt/docker-data"}\n' | sudo tee "$cfg" > /dev/null
+          fi
+          sudo systemctl start docker
+          # Verify the daemon actually came back on the new data-root; if a
+          # future runner image change breaks this, fail now with the daemon
+          # logs instead of half-way through the build with ENOSPC.
+          for i in $(seq 1 30); do
+            root_dir="$(sudo docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
+            if [ "$root_dir" = "/mnt/docker-data" ]; then
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "::error::docker did not come up with data-root /mnt/docker-data (got: '${root_dir:-nothing}')"
+              sudo journalctl -u docker --no-pager | tail -50
+              exit 1
+            fi
+            sleep 1
+          done
+          df -h / /mnt
+
+      - name: Check Docker Hub secrets
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "::error::Set the DOCKERHUB_USERNAME and DOCKERHUB_TOKEN repository secrets (Settings -> Secrets and variables -> Actions)."
+            exit 1
+          fi
+
+      - name: Compute image name
+        id: image
+        env:
+          REPO_OVERRIDE: ${{ vars.DOCKERHUB_REPO }}
+        run: |
+          if [ -n "$REPO_OVERRIDE" ]; then
+            repo="$REPO_OVERRIDE"
+          else
+            # Docker Hub namespaces must be lowercase; GitHub owners may not be.
+            repo="${GITHUB_REPOSITORY_OWNER,,}/stablegen-comfyui"
+          fi
+          echo "Docker Hub repository: $repo"
+          echo "name=$repo" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          # Keep the result a plain single-platform image (no provenance/SBOM
+          # attestation manifest list): friendliest for RunPod templates that
+          # pin image:tag or image@sha.
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Forward overrides only when given (workflow_dispatch inputs);
+          # empty lines are ignored, so Dockerfile ARG defaults apply otherwise.
+          build-args: |
+            ${{ inputs.base_tag && format('BASE_TAG={0}', inputs.base_tag) || '' }}
+            ${{ inputs.comfyui_version && format('COMFYUI_VERSION={0}', inputs.comfyui_version) || '' }}
+            ${{ inputs.stablegen_ref && format('STABLEGEN_REF={0}', inputs.stablegen_ref) || '' }}
+            ${{ inputs.extra_build_args }}
+          # No GHA cache: this image is far larger than the 10 GB cache quota,
+          # so cached layers would thrash and re-download more than they save.
+
+      - name: Job summary
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "### Pushed to Docker Hub: \`$IMAGE\`"
+            while IFS= read -r tag; do
+              [ -n "$tag" ] && echo "- \`$tag\`"
+            done <<< "$TAGS"
+            echo ""
+            echo "On runpod.io: set the template's **Container Image** to one of these tags and leave the start command empty (see README)."
+          } >> "$GITHUB_STEP_SUMMARY"
