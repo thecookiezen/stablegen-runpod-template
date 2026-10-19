@@ -17,23 +17,29 @@
 #                   tuned for it.
 #   STABLEGEN_REF   commit/tag of sakalond/StableGen that provides installer.py
 #                   (node clones + compat patches + model manifest).
-#   *_REF           pin a specific commit of a custom node repo. Empty means
-#                   "whatever the repo's default branch is at build time"; the
-#                   resolved SHAs are recorded in BUILD_INFO for debugging.
+#   COMFYUI_VERSION ComfyUI release baked INSTEAD of the base image's core.
+#                   RunPod's images lag upstream releases; the swap keeps the
+#                   image's locked torch stack but runs current ComfyUI. The
+#                   build fails if the base image already ships this version
+#                   or newer (then drop the override).
+#   *_REF           pinned commit of a custom node repo. The defaults are the
+#                   newest commits verified to work with StableGen's installer
+#                   (see README); the resolved SHAs are recorded in BUILD_INFO.
 
-ARG BASE_TAG=1.4.0-comfyuiv0.35.0-cuda12.8
+ARG BASE_TAG=1.5.0-rc.181-comfyuiv0.35.0-cuda12.8
 FROM runpod/comfyui:${BASE_TAG}
 
 # Re-declare so the tag is recorded in BUILD_INFO (ARGs before FROM don't
 # flow into the build stage unless re-declared).
 ARG BASE_TAG
+ARG COMFYUI_VERSION=v0.41.1
 
 ARG STABLEGEN_REF=1d6e83fc966afc8b2c196c011b75ce7cdaa07c83
-ARG TRELLIS2_REF=
-ARG IPADAPTER_REF=
-ARG GGUF_REF=
-ARG MARIGOLD_REF=
-ARG STABLEDELIGHT_REF=
+ARG TRELLIS2_REF=3e696f2cf174dba141c9efce0205e9a2d87e908a
+ARG IPADAPTER_REF=a0f451a5113cf9becb0847b92884cb10cbdec0ef
+ARG GGUF_REF=6ea2651e7df66d7585f6ffee804b20e92fb38b8a
+ARG MARIGOLD_REF=2adfec75c430b0751a98a82453dc2dd8077bca85
+ARG STABLEDELIGHT_REF=42c0463cc65554509804cbf577a1675c61499ec4
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -43,6 +49,56 @@ RUN test -f /opt/comfyui-baked/main.py || { \
       echo "       The image layout changed; update BASE_TAG and the paths in start.sh." >&2; \
       exit 1; \
     }
+
+# --- ComfyUI core override ----------------------------------------------------
+# Swap the base image's (older) ComfyUI core for a pinned upstream release,
+# keeping what the base image adds around it:
+#   * custom_nodes/{ComfyUI-KJNodes, Civicomfy, ComfyUI-RunpodDirect}
+#     (ComfyUI-Manager is NOT a baked node in newer base images: it ships as
+#     the comfyui_manager pip package, loaded by core via --enable-manager)
+#   * user/__manager (pre-baked ComfyUI-Manager cache/config)
+#   * the git repo (re-created + tagged so Manager reports the real version)
+# The torch stack is NOT touched: the new core's requirements install against
+# /opt/comfyui-runtime-constraints.txt, so torch/torchvision/torchaudio stay
+# at the image's CUDA-matched pins. Only pure-Python packages (frontend,
+# workflow templates, embedded docs, comfy-kitchen, comfy-aimdo) move; the
+# comfyui_manager pip package version is checked against the new core's
+# manager_requirements.txt pin by the base start script on every boot.
+# The manifest line we append makes the base start script's
+# upgrade_comfyui_if_needed() rsync this core over an existing /workspace
+# install on the next pod boot (models, user data and custom nodes excluded).
+RUN set -eux; \
+    baked_comfyui="$(sed -n 's/^COMFYUI_VERSION=//p' /opt/comfyui-baked/.runpod-bundle-version)"; \
+    if printf '%s\n%s\n' "${COMFYUI_VERSION#v}" "${baked_comfyui#v}" | sort -V | head -1 | grep -qx "${COMFYUI_VERSION#v}"; then \
+      echo "ERROR: base image already ships ComfyUI ${baked_comfyui} >= override ${COMFYUI_VERSION}." >&2; \
+      echo "       Drop the COMFYUI_VERSION override (or bump it) and rebuild." >&2; \
+      exit 1; \
+    fi; \
+    curl -fSL "https://github.com/comfyanonymous/ComfyUI/archive/refs/tags/${COMFYUI_VERSION}.tar.gz" \
+      -o /tmp/comfyui-core.tar.gz; \
+    mkdir -p /tmp/comfyui-core; \
+    tar xzf /tmp/comfyui-core.tar.gz --strip-components=1 -C /tmp/comfyui-core; \
+    mkdir -p /tmp/comfyui-core/custom_nodes /tmp/comfyui-core/user; \
+    cp -a /opt/comfyui-baked/custom_nodes/. /tmp/comfyui-core/custom_nodes/; \
+    cp -a /opt/comfyui-baked/user/. /tmp/comfyui-core/user/; \
+    cp -a /opt/comfyui-baked/.runpod-bundle-version /tmp/comfyui-core/.runpod-bundle-version; \
+    rm -rf /opt/comfyui-baked; \
+    mv /tmp/comfyui-core /opt/comfyui-baked; \
+    rm /tmp/comfyui-core.tar.gz; \
+    test -f /opt/comfyui-baked/main.py; \
+    test -d /opt/comfyui-baked/custom_nodes/ComfyUI-KJNodes; \
+    test -d /opt/comfyui-baked/custom_nodes/Civicomfy; \
+    test -d /opt/comfyui-baked/custom_nodes/ComfyUI-RunpodDirect; \
+    test ! -d /opt/comfyui-baked/custom_nodes/custom_nodes; \
+    printf 'STABLEGEN_COMFYUI_OVERRIDE=%s\n' "$COMFYUI_VERSION" >> /opt/comfyui-baked/.runpod-bundle-version; \
+    cd /opt/comfyui-baked; \
+    rm -rf .git; \
+    git init -q; git add -A; \
+    git -c user.name=- -c user.email=- commit -q -m "ComfyUI ${COMFYUI_VERSION} (stablegen-runpod-template)"; \
+    git tag "${COMFYUI_VERSION}"; \
+    git remote add origin https://github.com/comfyanonymous/ComfyUI.git; \
+    pip install --constraint /opt/comfyui-runtime-constraints.txt \
+      -r /opt/comfyui-baked/requirements.txt
 
 # Small system deps the boot script assumes (most are already in the base image).
 RUN apt-get update \
@@ -89,9 +145,10 @@ COPY start.sh /start.sh
 COPY stablegen_install.py /opt/stablegen-template/stablegen_install.py
 RUN chmod +x /start.sh /opt/stablegen-template/stablegen_install.py
 
-# Record what went into this image (base tag + exact node commits).
+# Record what went into this image (base tag + ComfyUI core + exact node commits).
 RUN { \
       echo "base_image: runpod/comfyui:${BASE_TAG}"; \
+      echo "comfyui_core: ${COMFYUI_VERSION} (upstream release, overrides base image core)"; \
       echo "stablegen: ${STABLEGEN_REF}"; \
       echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
       for d in /opt/comfyui-baked/custom_nodes/*; do \

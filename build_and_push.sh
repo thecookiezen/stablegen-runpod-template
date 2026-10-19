@@ -9,7 +9,8 @@
 #   ./build_and_push.sh ghcr.io/myuser/stablegen-comfyui:0.1.0
 #
 # Build-arg overrides (see Dockerfile for the full list):
-#   BASE_TAG=1.4.1-rc.175-comfyuiv0.35.0-cuda12.8 ./build_and_push.sh ...
+#   BASE_TAG=1.5.0-rc.190-comfyuiv0.35.0-cuda12.8 ./build_and_push.sh ...
+#   COMFYUI_VERSION=v0.42.0                     ./build_and_push.sh ...
 #   STABLEGEN_REF=<commit>                        ./build_and_push.sh ...
 #   TRELLIS2_REF=<commit>                         ./build_and_push.sh ...
 #
@@ -21,16 +22,19 @@ set -euo pipefail
 IMAGE="${1:?usage: ./build_and_push.sh <registry-repo>[:tag]}"
 cd "$(dirname "$0")"
 
-BASE_TAG="${BASE_TAG:-1.4.0-comfyuiv0.35.0-cuda12.8}"
+BASE_TAG="${BASE_TAG:-1.5.0-rc.181-comfyuiv0.35.0-cuda12.8}"
+COMFYUI_VERSION="${COMFYUI_VERSION:-v0.41.1}"
 STABLEGEN_REF="${STABLEGEN_REF:-1d6e83fc966afc8b2c196c011b75ce7cdaa07c83}"
 
 echo "Building ${IMAGE}"
 echo "  BASE_TAG=${BASE_TAG}"
+echo "  COMFYUI_VERSION=${COMFYUI_VERSION}"
 echo "  STABLEGEN_REF=${STABLEGEN_REF}"
 
 docker buildx build \
   --platform linux/amd64 \
   --build-arg BASE_TAG="${BASE_TAG}" \
+  --build-arg COMFYUI_VERSION="${COMFYUI_VERSION}" \
   --build-arg STABLEGEN_REF="${STABLEGEN_REF}" \
   ${TRELLIS2_REF:+--build-arg TRELLIS2_REF="${TRELLIS2_REF}"} \
   ${IPADAPTER_REF:+--build-arg IPADAPTER_REF="${IPADAPTER_REF}"} \

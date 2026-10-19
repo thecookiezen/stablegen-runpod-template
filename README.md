@@ -13,7 +13,7 @@ pay the setup cost once. Later boots verify and launch in a couple of minutes.
 
 | Component | Where | Size |
 |---|---|---|
-| ComfyUI (from RunPod image, with JupyterLab + Manager) | `/workspace/runpod-slim/ComfyUI` | in image |
+| ComfyUI v0.41.1 (upstream release on the RunPod image runtime, with JupyterLab + Manager) | `/workspace/runpod-slim/ComfyUI` | in image |
 | Custom nodes: IPAdapter Plus, GGUF, TRELLIS2, Marigold, StableDelight | `ComfyUI/custom_nodes/` | in image |
 | SDXL stack: IPAdapter + CLIP vision models, ControlNets (depth + union + alt), Lightning/Hyper LoRAs | `ComfyUI/models/...` | ~14 GB |
 | RealVisXL V5.0 fp16 checkpoint (ready-to-use SDXL base) | `ComfyUI/models/checkpoints/` | ~6.5 GB |
@@ -32,7 +32,8 @@ time. Nothing in the default set is gated: no HuggingFace token required.
 
 ```
 stablegen-runpod-template/
-├── Dockerfile            # runpod/comfyui (pinned, cuda12.8) + pre-cloned nodes
+├── Dockerfile            # runpod/comfyui (pinned, cuda12.8) + ComfyUI core
+│                         #   override (COMFYUI_VERSION) + pinned nodes
 ├── start.sh              # boot script; installed as the image's /start.sh entrypoint
 ├── stablegen_install.py  # headless driver for StableGen's installer.py
 ├── build_and_push.sh     # local build helper
@@ -62,12 +63,15 @@ Useful overrides:
 
 ```bash
 # New RunPod image release (check hub.docker.com/r/runpod/comfyui/tags):
-BASE_TAG=1.4.1-rc.175-comfyuiv0.35.0-cuda12.8 ./build_and_push.sh ...
+BASE_TAG=1.5.0-rc.190-comfyuiv0.35.0-cuda12.8 ./build_and_push.sh ...
+
+# Newer ComfyUI core than the baked override:
+COMFYUI_VERSION=v0.42.0 ./build_and_push.sh ...
 
 # Newer StableGen commit (installer.py + patches):
 STABLEGEN_REF=<commit-or-tag> ./build_and_push.sh ...
 
-# Pin a node repo to a known commit:
+# Move a single node repo to another commit:
 TRELLIS2_REF=<commit> ./build_and_push.sh ...
 ```
 
@@ -117,10 +121,12 @@ Optional template env vars:
   Manually: `cd /workspace/runpod-slim/ComfyUI/custom_nodes/<node> && git pull`,
   then restart the pod.
 - **Update everything to a new image**: rebuild + push the image, update the
-  template. Then either start a pod with a fresh volume, or delete
-  `/workspace/runpod-slim/ComfyUI` on the existing volume so the new baked
-  copy (with updated nodes) is copied in. Models, compiled envs, and HF cache
-  on the volume are reused either way.
+  template, restart the pod. The ComfyUI core upgrades in place via the
+  bundle-manifest mechanism (see above); models, compiled envs, and HF cache
+  on the volume are reused. The five StableGen nodes are user-owned and are
+  NOT refreshed by that path: either update them via ComfyUI-Manager, or
+  delete `/workspace/runpod-slim/ComfyUI` before restarting so the new baked
+  copy (with updated node pins) is copied in.
 - **Update StableGen's installer logic** (node pins, patches): rebuild the
   image with a newer `STABLEGEN_REF`.
 
@@ -128,12 +134,23 @@ Optional template env vars:
 
 Everything is deliberately **pinned**:
 
-- The base image `runpod/comfyui:1.4.0-comfyuiv0.35.0-cuda12.8` bakes
-  ComfyUI **v0.35.0** (a release tag, not `main`), ComfyUI-Manager/KJNodes at
-  pinned SHAs, torch `2.10.0+cu128` on Ubuntu 24.04 with Python 3.12.
-- Upstream ComfyUI moves faster than the image (v0.4x exists upstream); the
-  image only advances when RunPod cuts a new release. That is a feature for a
-  backend: StableGen's workflows target whatever nodes the server has.
+- The base image `runpod/comfyui:1.5.0-rc.181-comfyuiv0.35.0-cuda12.8` provides
+  the locked runtime: torch `2.10.0+cu128` on Ubuntu 24.04 with Python 3.12,
+  JupyterLab/FileBrowser/SSH plumbing, three managed custom nodes
+  (KJNodes, Civicomfy, RunpodDirect) at pinned SHAs, and ComfyUI-Manager as
+  the `comfyui_manager` pip package (4.2.2) loaded by core via
+  `--enable-manager` — not a baked custom node.
+- RunPod's images bake ComfyUI **v0.35.0** and only advance when RunPod cuts a
+  new release, which lags upstream. The build therefore **overrides the baked
+  core with a pinned upstream release** (`COMFYUI_VERSION`, currently
+  **v0.41.1**): the release tarball replaces the core in
+  `/opt/comfyui-baked` (keeping the managed nodes and the Manager cache),
+  the git repo is re-tagged so ComfyUI-Manager reports the real version, and
+  only pure-Python packages (frontend, workflow templates, comfy-kitchen,
+  comfy-aimdo) are upgraded. The CUDA-matched torch stack is untouched
+  (installed against the image's constraint file).
+- The Dockerfile **fails the build** if a future base image already ships a
+  ComfyUI >= `COMFYUI_VERSION`; at that point drop the override or bump it.
 - Floating tags `runpod/comfyui:cuda12.8` and `:latest` always track the
   newest build. This template pins a versioned tag so behavior cannot change
   under you; bump `BASE_TAG` deliberately when you want to move.
@@ -141,6 +158,32 @@ Everything is deliberately **pinned**:
   `/opt/comfyui-runtime-constraints.txt` (torch pins). The boot script exports
   `PIP_CONSTRAINT` from the latter so no later `pip install` can disturb the
   CUDA-matched torch stack.
+- **Updating an existing pod**: the override appends a line to
+  `.runpod-bundle-version`, so on the next boot the base image's own upgrade
+  logic rsyncs the new core over `/workspace/runpod-slim/ComfyUI` (models,
+  user data, and custom nodes are excluded; the three managed nodes are
+  refreshed; StableGen's five nodes are treated as user-owned and left
+  alone). Nothing to do manually.
+
+## Custom node pins
+
+The five StableGen node repos are cloned at exact commits (see the `*_REF`
+build args in the Dockerfile). The pins were chosen as follows:
+
+- `ComfyUI-TRELLIS2` `3e696f2` — the current node requires the post-March
+  2026 layout: StableGen's addon workflows use `Trellis2ProcessMesh`, which
+  only exists there, and the node handles VRAM via ComfyUI's native model
+  management. Most of StableGen installer's old-layout compat patches
+  therefore skip with a warning on boot; that is expected and harmless
+  (three patches, including the comfy-env auto-heal, still apply).
+- `ComfyUI-GGUF`, `ComfyUI_IPAdapter_plus`, `ComfyUI-Marigold`,
+  `ComfyUI_StableDelight_ll` — their latest commits; all register plain
+  nodes against the stable custom-node API and are insensitive to the core
+  version bump.
+
+Rebuild with e.g. `TRELLIS2_REF=<sha> ./build_and_push.sh ...` to move a
+single node; the resolved SHAs of every build are printed and stored in
+`/opt/stablegen-template/BUILD_INFO`.
 
 ## How it stays standing on RunPod's image
 
@@ -154,14 +197,16 @@ plus corrections for how the current ComfyUI-TRELLIS2 actually behaves:
   ComfyUI interpreter.
 - `PIP_CONSTRAINT` from the image keeps torch/torchvision/torchaudio pinned
   during all node requirement installs.
-- `huggingface-hub` is pinned `>=1.5.0,<2.0` before installs, and re-pinned
-  after, because the image's `transformers` hard-requires that range. Hub 2.x
-  creeping in is what crashes ComfyUI at import with
-  `ImportError: huggingface-hub>=1.5.0,<2.0 is required`.
+- `huggingface-hub` is pinned into the range the image's `transformers`
+  declares for itself (derived from its package metadata at boot: the current
+  base ships transformers 5.x requiring hub >=1.31.0,<3.0; older bases
+  hard-required <2.0). The pin goes on before installs and is re-applied
+  after if `import transformers` fails, because hub drifting out of range is
+  what crashes ComfyUI at import.
 - Compiled envs persist in `COMFY_ENV_ROOT=/workspace/.ce`; pip/pixi/uv caches
   go to ephemeral container disk so the volume stays lean.
 - The base image's own upgrade logic (`.runpod-bundle-version` manifest)
-  refreshes ComfyUI core and its four managed nodes when you bump `BASE_TAG`,
+  refreshes ComfyUI core and its managed nodes when you bump `BASE_TAG`,
   while treating the StableGen nodes as user-owned and leaving them alone.
   To force a node back to the image's baked version, delete its directory
   under `custom_nodes/` and restart the pod.

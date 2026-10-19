@@ -22,9 +22,12 @@
 #   * CUDA extensions are compiled per GPU arch. A network volume shared
 #     between e.g. a 4090 and a 5090 pod must rebuild when the arch changes;
 #     the stamp-file guard below handles that automatically.
-#   * The image's transformers (system site-packages) hard-requires
-#     huggingface-hub>=1.5.0,<2.0. Any unbounded pip install can pull hub 2.x
-#     and crash ComfyUI at import. We pin before AND heal after installing.
+#   * The image's transformers (system site-packages, shared into the venv)
+#     only imports with a huggingface-hub version inside its declared range
+#     (older images: >=1.5.0,<2.0; current: >=1.31.0,<3.0). Any unbounded pip
+#     install can drag hub out of range and crash ComfyUI at import. We pin
+#     the range (derived from the installed transformers) before installs AND
+#     heal after.
 #   * Nothing here is fatal unless ComfyUI itself cannot start: every optional
 #     step warns and continues.
 #
@@ -40,6 +43,11 @@
 # =============================================================================
 
 echo "=== StableGen RunPod template: boot start ($(date -u +%FT%TZ)) ==="
+
+# Record what the image bakes (base tag, ComfyUI core override, node pins).
+[ -f /opt/stablegen-template/BUILD_INFO ] && sed 's/^/  /' /opt/stablegen-template/BUILD_INFO
+[ -f /opt/comfyui-baked/.runpod-bundle-version ] \
+  && echo "  baked bundle: $(tr '\n' ' ' < /opt/comfyui-baked/.runpod-bundle-version)"
 
 # --- System dependencies (already in the image; cheap no-op otherwise) ------
 apt-get update -qq >/dev/null 2>&1
@@ -173,13 +181,31 @@ if ! grep -q "COMFY_ENV_ROOT" /root/.bashrc 2>/dev/null; then
 fi
 
 # --- Installer driver -------------------------------------------------------
-# The hub pin goes FIRST: the image's transformers (shared into the venv from
-# system site-packages) hard-requires huggingface-hub>=1.5.0,<2.0 and any
-# later unbounded pip install can silently pull hub 2.x.
+# The hub pin goes FIRST: any later unbounded pip install (node requirements)
+# can pull a huggingface-hub major the image's transformers cannot import
+# with. The allowed range is DERIVED from the installed transformers' own
+# metadata (older base images hard-required hub<2.0; the current one ships
+# transformers 5.x + hub 2.x, requiring >=1.31,<3.0), so this stays correct
+# whatever the base image locks.
+hub_pin() {
+  "$PY" - <<'EOF' 2>/dev/null
+import importlib.metadata as m
+for r in (m.requires("transformers") or []):
+    if r.replace(" ", "").replace("_", "-").startswith("huggingface-hub"):
+        print(r)
+        break
+EOF
+}
 if [ "${STABLEGEN_SKIP_INSTALL:-0}" != "1" ]; then
   echo "=== Installing StableGen components (nodes + models) ==="
-  "$PIP" install -q "huggingface-hub>=1.5.0,<2.0" requests tqdm \
-    || echo "WARN: failed to pin huggingface-hub / install driver deps"
+  HUB_REQ="$(hub_pin)"
+  if [ -n "$HUB_REQ" ]; then
+    echo "Pinning ${HUB_REQ} (range required by the image's transformers)"
+    "$PIP" install -q "$HUB_REQ" requests tqdm \
+      || echo "WARN: failed to pin huggingface-hub / install driver deps"
+  else
+    "$PIP" install -q requests tqdm || true
+  fi
 
   if "$PY" /opt/stablegen-template/stablegen_install.py "$COMFYUI_PATH"; then
     echo "StableGen installer driver finished OK."
@@ -193,11 +219,12 @@ else
 fi
 
 # --- Post-install hub pin heal ----------------------------------------------
-# Crash signature this prevents:
-#   ImportError: huggingface-hub>=1.5.0,<2.0 is required ... found 2.x
+# Crash signature this prevents: transformers refusing to import because a
+# node install dragged huggingface-hub out of the range it accepts.
 if ! "$PY" -c "import transformers" >/dev/null 2>&1; then
+  HUB_REQ="$(hub_pin)"
   echo "WARN: transformers import failed -> re-pinning huggingface-hub into range"
-  "$PIP" install "huggingface-hub>=1.5.0,<2.0"
+  [ -n "$HUB_REQ" ] && "$PIP" install "$HUB_REQ"
   "$PY" -c "import transformers" \
     || echo "ERROR: transformers still broken; nodes using it will fail to load"
 fi
