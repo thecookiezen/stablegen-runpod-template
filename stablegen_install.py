@@ -37,8 +37,10 @@ Default tag set and approximate download volume onto the network volume:
 
 import os
 import re
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 STABLEGEN_REPO = Path(os.environ.get("STABLEGEN_REPO", "/opt/stablegen"))
@@ -84,6 +86,88 @@ def _pin_version(spec: str):
     return m.group(1) if m else None
 
 
+# ---------------------------------------------------------------------------
+# install.py heartbeat
+#
+# install.py steps nest subprocesses (comfy-env -> pixi -> rattler/uv) that
+# can run SILENT for 10-30+ minutes on first boot: comfy-env forces
+# PIXI_NO_PROGRESS=true, which suppresses every solve/download/link progress
+# line. From the outside a healthy build is indistinguishable from a wedged
+# network read. The wrapper below (installed onto installer.py's subprocess
+# module, so it also covers installer.py's internal retry paths) prints a
+# liveness line every STABLEGEN_HEARTBEAT_SECS (default 60) showing the
+# caches/env dirs growing, and can kill the whole process group after
+# STABLEGEN_INSTALL_TIMEOUT seconds (default 0 = wait forever; the component
+# is then marked failed and the boot continues, retried on next boot).
+# ---------------------------------------------------------------------------
+HEARTBEAT_SECS = max(5, int(os.environ.get("STABLEGEN_HEARTBEAT_SECS", "60")))
+INSTALL_TIMEOUT = int(os.environ.get("STABLEGEN_INSTALL_TIMEOUT", "0"))
+
+
+def _du_mb(path: str) -> str:
+    try:
+        r = subprocess.run(["du", "-sm", path], capture_output=True, text=True, timeout=180)
+        if r.returncode == 0 and r.stdout.split():
+            return f"{r.stdout.split()[0]}MB"
+    except Exception:
+        pass
+    return "?"
+
+
+def _make_install_script_heartbeat(installer):
+    """Wrap subprocess.run inside installer.py so install.py runs heartbeat."""
+    orig_run = installer.subprocess.run  # the stdlib subprocess module
+
+    def _du_line() -> str:
+        ce = os.environ.get("COMFY_ENV_ROOT", "/workspace/.ce")
+        pixi = os.environ.get("PIXI_CACHE_DIR", str(Path.home() / ".pixi"))
+        uv = os.environ.get("UV_CACHE_DIR", str(Path.home() / ".cache" / "uv"))
+        return (f"pixi-cache={_du_mb(pixi)} uv-cache={_du_mb(uv)} "
+                f"envs={_du_mb(ce)}")
+
+    def _run(args, **kwargs):
+        cmd = list(args) if isinstance(args, (list, tuple)) else [args]
+        is_install_script = any(
+            isinstance(a, (str, os.PathLike)) and str(a).endswith("install.py")
+            for a in cmd
+        )
+        if not is_install_script:
+            return orig_run(args, **kwargs)
+
+        check = kwargs.pop("check", False)
+        cwd = kwargs.pop("cwd", None)
+        print(f"  [watchdog] heartbeat every {HEARTBEAT_SECS}s "
+              f"(pixi/rattler/uv are silent by design; sizes growing = working)",
+              flush=True)
+        # Own process group so a timeout kill takes out the nested
+        # install.py -> comfy-env -> pixi tree, not just the top child.
+        proc = subprocess.Popen(cmd, cwd=cwd, start_new_session=True)
+        start = time.monotonic()
+        while True:
+            try:
+                proc.wait(timeout=HEARTBEAT_SECS)
+                break
+            except subprocess.TimeoutExpired:
+                elapsed = int(time.monotonic() - start)
+                print(f"  [install.py +{elapsed // 60}m{elapsed % 60:02d}s] "
+                      f"{_du_line()}", flush=True)
+                if INSTALL_TIMEOUT and elapsed >= INSTALL_TIMEOUT:
+                    print(f"  TIMEOUT after {elapsed}s "
+                          f"(STABLEGEN_INSTALL_TIMEOUT) -> killing install.py",
+                          flush=True)
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except Exception:
+                        proc.kill()
+                    proc.wait()
+                    break
+        if check and proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, cmd)
+        return subprocess.CompletedProcess(cmd, proc.returncode)
+
+    installer.subprocess.run = _run
+
+
 def _installed_comfy_env_version():
     try:
         result = subprocess.run(
@@ -120,6 +204,10 @@ def main() -> int:
 
     sys.path.insert(0, str(STABLEGEN_REPO))
     import installer  # noqa: E402  (path set above on purpose)
+
+    # install.py runs (comfy-env -> pixi) are silent for long stretches; make
+    # them visibly alive (and optionally bounded) before any of them start.
+    _make_install_script_heartbeat(installer)
 
     tags = [t for t in os.environ.get("STABLEGEN_TAGS", DEFAULT_TAGS).split() if t]
     item_ids = sorted(installer.get_unique_item_ids_for_tags(tags))

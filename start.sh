@@ -101,7 +101,13 @@ fi
 # --- Sync image-baked StableGen nodes into the workspace (offline-first) ----
 # Nodes deleted from the workspace are restored from the image without
 # touching GitHub. Existing (possibly newer, Manager-updated) nodes win.
-for node in ComfyUI_IPAdapter_plus ComfyUI-GGUF ComfyUI-TRELLIS2 ComfyUI-Marigold ComfyUI_StableDelight_ll ComfyUI-HY-Motion1 ComfyUI-UniRig; do
+# NOTE: the motion nodes (ComfyUI-HY-Motion1, ComfyUI-UniRig) are intentionally
+# NOT restored here: comfy-env's workspace install picks up every
+# custom_nodes/*/comfy-env.toml present at install time (UniRig ships one), so
+# they must only appear AFTER the installer driver below has built the
+# StableGen envs. The motion section restores them from
+# /opt/stablegen-template/motion-nodes.
+for node in ComfyUI_IPAdapter_plus ComfyUI-GGUF ComfyUI-TRELLIS2 ComfyUI-Marigold ComfyUI_StableDelight_ll; do
   if [ -d "/opt/comfyui-baked/custom_nodes/$node" ] && [ ! -d "$COMFYUI_PATH/custom_nodes/$node" ]; then
     echo "Restoring baked node: $node"
     cp -a "/opt/comfyui-baked/custom_nodes/$node" "$COMFYUI_PATH/custom_nodes/$node"
@@ -315,6 +321,19 @@ fi
 if [ "${STABLEGEN_SKIP_MOTION:-0}" != "1" ]; then
   phase "Motion add-on: ComfyUI-HY-Motion1 (text-to-motion) + ComfyUI-UniRig (auto-rig)"
 
+  # --- Restore the motion nodes (baked outside the ComfyUI tree) -----------
+  # They are copied in only NOW (not with the StableGen nodes above) because
+  # comfy-env's workspace install discovers every custom_nodes/*/comfy-env.toml
+  # present at install time: with UniRig present, the installer driver's
+  # TRELLIS2 step would also build UniRig's heavy pixi env in its critical
+  # path. Here the build is labeled and a failure only costs the motion nodes.
+  for node in ComfyUI-HY-Motion1 ComfyUI-UniRig; do
+    if [ -d "/opt/stablegen-template/motion-nodes/$node" ] && [ ! -d "$COMFYUI_PATH/custom_nodes/$node" ]; then
+      echo "Restoring motion node: $node"
+      cp -a "/opt/stablegen-template/motion-nodes/$node" "$COMFYUI_PATH/custom_nodes/$node"
+    fi
+  done
+
   # --- ComfyUI-HY-Motion1: venv-level deps ---------------------------------
   # Pure-Python (torch is protected by PIP_CONSTRAINT). fbxsdkpy (optional,
   # FBX export only - GLB export needs nothing extra) lives on an extra index
@@ -340,9 +359,19 @@ if [ "${STABLEGEN_SKIP_MOTION:-0}" != "1" ]; then
     "$PY" -m pip install -q -r /tmp/unirig-reqs.txt \
       || echo "WARN: UniRig venv requirements failed (node may still work)"
     echo "Building/verifying UniRig isolated env (comfy-env/pixi; first build takes a while)..."
+    # pixi/rattler/uv print NOTHING during solve+download+link
+    # (PIXI_NO_PROGRESS=true), which can be 10+ minutes of silence on first
+    # build. Heartbeat every 60s so this phase can't be mistaken for a hang;
+    # sizes growing = still working.
+    WD_START=$SECONDS
+    ( while :; do sleep 60; \
+        echo "    [unirig-env +$(((SECONDS - WD_START) / 60))min] $(du -sm "$PIXI_CACHE_DIR" "$UV_CACHE_DIR" "$COMFY_ENV_ROOT" 2>/dev/null | awk '{printf "%s=%sMB ", $2, $1}')"; \
+      done ) &
+    UNIRIG_WD=$!
     ( cd "$UNIRIG_NODE" && "$PY" install.py ) \
       || echo "WARN: UniRig install.py failed. Re-run once ComfyUI is up:" \
            "cd $UNIRIG_NODE && $PY install.py"
+    kill "$UNIRIG_WD" 2>/dev/null
   else
     echo "WARN: $UNIRIG_NODE missing; skipping its install"
   fi

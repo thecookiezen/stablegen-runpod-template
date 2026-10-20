@@ -121,6 +121,16 @@ RUN git clone https://github.com/sakalond/StableGen.git /opt/stablegen \
 # this tree to /workspace on first boot, and the StableGen installer driver
 # then applies its compat patches, pip deps and install.py steps on top.
 # .git dirs are kept so ComfyUI-Manager can still update nodes later.
+#
+# The two motion nodes are deliberately baked OUTSIDE this tree (see the
+# motion-nodes block below): comfy-env's workspace install discovers EVERY
+# custom_nodes/*/comfy-env.toml present at install time, and UniRig ships one.
+# Baked into the tree, UniRig's heavy pixi env (bpy/ffmpeg/mesalib conda deps
+# + pytorch-lightning/transformers pypi deps) gets dragged into the StableGen
+# installer's TRELLIS2 step, making the critical first-boot path longer and
+# much harder to attribute. start.sh copies the motion nodes into custom_nodes
+# only AFTER the installer driver finished; their envs then build in the
+# clearly-labeled, failure-tolerant motion phase.
 RUN set -eux; \
     baked=/opt/comfyui-baked/custom_nodes; \
     mkdir -p "$baked"; \
@@ -137,7 +147,23 @@ RUN set -eux; \
     clone ComfyUI-GGUF             https://github.com/city96/ComfyUI-GGUF.git              "${GGUF_REF}"; \
     clone ComfyUI-TRELLIS2         https://github.com/PozzettiAndrea/ComfyUI-TRELLIS2.git  "${TRELLIS2_REF}"; \
     clone ComfyUI-Marigold         https://github.com/kijai/ComfyUI-Marigold.git            "${MARIGOLD_REF}"; \
-    clone ComfyUI_StableDelight_ll https://github.com/lldacing/ComfyUI_StableDelight_ll.git "${STABLEDELIGHT_REF}"; \
+    clone ComfyUI_StableDelight_ll https://github.com/lldacing/ComfyUI_StableDelight_ll.git "${STABLEDELIGHT_REF}"
+
+# Motion add-on nodes (same pinning mechanics), staged outside the ComfyUI
+# tree. Copied into custom_nodes by start.sh's motion section (after the
+# StableGen installer driver), so they never widen the installer's pixi solve.
+RUN set -eux; \
+    motion=/opt/stablegen-template/motion-nodes; \
+    mkdir -p "$motion"; \
+    clone() { \
+      name="$1"; url="$2"; ref="$3"; \
+      if [ -n "$ref" ]; then \
+        git clone "$url" "$motion/$name" \
+          && git -C "$motion/$name" checkout "$ref"; \
+      else \
+        git clone --depth 1 "$url" "$motion/$name"; \
+      fi; \
+    }; \
     clone ComfyUI-HY-Motion1       https://github.com/jtydhr88/ComfyUI-HY-Motion1.git      "${HYMOTION_REF}"; \
     clone ComfyUI-UniRig           https://github.com/PozzettiAndrea/ComfyUI-UniRig.git    "${UNIRIG_REF}"
 
@@ -175,7 +201,7 @@ RUN { \
       echo "comfyui_core: ${COMFYUI_VERSION} (upstream release, overrides base image core)"; \
       echo "stablegen: ${STABLEGEN_REF}"; \
       echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
-      for d in /opt/comfyui-baked/custom_nodes/*; do \
+      for d in /opt/comfyui-baked/custom_nodes/* /opt/stablegen-template/motion-nodes/*; do \
         [ -d "$d" ] || continue; \
         echo "node $(basename "$d"): $(git -C "$d" rev-parse HEAD 2>/dev/null || echo unknown)"; \
       done; \

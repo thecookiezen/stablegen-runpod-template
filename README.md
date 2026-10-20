@@ -18,7 +18,7 @@ pay the setup cost once. Later boots verify and launch in a couple of minutes.
 |---|---|---|
 | ComfyUI v0.41.1 (upstream release on the RunPod image runtime, with JupyterLab + Manager) | `/workspace/runpod-slim/ComfyUI` | in image |
 | Custom nodes: IPAdapter Plus, GGUF, TRELLIS2, Marigold, StableDelight | `ComfyUI/custom_nodes/` | in image |
-| Custom nodes: HY-Motion1 (text-to-motion), UniRig (auto-rig) | `ComfyUI/custom_nodes/` | in image |
+| Custom nodes: HY-Motion1 (text-to-motion), UniRig (auto-rig) | staged in image at `/opt/stablegen-template/motion-nodes/`, copied to `ComfyUI/custom_nodes/` after the StableGen installer | in image |
 | SDXL stack: IPAdapter + CLIP vision models, ControlNets (depth + union + alt), Lightning/Hyper LoRAs | `ComfyUI/models/...` | ~14 GB |
 | RealVisXL V5.0 fp16 checkpoint (ready-to-use SDXL base) | `ComfyUI/models/checkpoints/` | ~6.5 GB |
 | Qwen Image Edit 2509: GGUF UNet (Q3_K_M), VAE, text encoder, Lightning LoRA | `ComfyUI/models/...` | ~20 GB |
@@ -56,8 +56,13 @@ The image bakes in:
 - `/start.sh` - our boot script, installed as the image entrypoint
 - `/opt/stablegen-template/` - `stablegen_install.py` (the headless driver) and `BUILD_INFO`
 - `/start-runpod.sh` - RunPod's original launcher, exec'd at the end of our `/start.sh`
-- `/opt/comfyui-baked/custom_nodes/` - the seven custom node repos (five
-  StableGen + HY-Motion1 + UniRig), pre-cloned
+- `/opt/comfyui-baked/custom_nodes/` - the five StableGen custom node repos,
+  pre-cloned (part of the baked ComfyUI copy that lands on the volume)
+- `/opt/stablegen-template/motion-nodes/` - the two motion node repos
+  (HY-Motion1 + UniRig), pre-cloned but staged OUTSIDE the ComfyUI tree;
+  `start.sh` copies them into `custom_nodes/` only after the StableGen
+  installer ran, so their (heavier) comfy-env/pixi env builds never widen the
+  installer's critical path
 - The installer driver's own deps (`comfy-env` at the pinned schema version
   derived from TRELLIS2's requirements.txt, plus `requests` and `tqdm`) in
   system site-packages, so the first boot's driver run needs no PyPI
@@ -138,13 +143,19 @@ Optional template env vars:
 | `STABLEGEN_SKIP_INSTALL=1` | Skip node/model installation entirely (quick boot, debug only). |
 | `STABLEGEN_SKIP_MODELS=1` | Skip the TRELLIS.2/DinoV3/BiRefNet weight prefetch. |
 | `STABLEGEN_SKIP_MOTION=1` | Skip the text-to-animation add-on (HY-Motion + UniRig nodes, deps, envs and weights). |
+| `STABLEGEN_HEARTBEAT_SECS` | How often the installer prints a liveness line during the (by design silent) comfy-env/pixi install.py steps, in seconds. Default 60. |
+| `STABLEGEN_INSTALL_TIMEOUT` | Wall-clock limit in seconds for each node's install.py step (which nests the silent pixi solve/download/link). `0` (default) waits forever; on timeout the whole install.py process group is killed, the component is marked failed and the boot continues (retried on next boot). |
 
 ## First boot vs. later boots
 
 - **First boot** (60-120 min): copies ComfyUI to the volume, applies StableGen's
   compat patches, runs the TRELLIS2 installer (compiles CUDA kernels for your
-  GPU), builds the UniRig env, downloads all models (~80 GB). Progress is
-  visible in the pod logs.
+  GPU), builds the UniRig env, downloads all models (~80 GB). Most steps stream
+  their progress — the one big exception: the comfy-env/pixi environment builds
+  print **nothing** for 10-30+ min while pixi solves/downloads/links (silence
+  is pixi-by-design under `PIXI_NO_PROGRESS=true`). The boot script prints a
+  `[install.py ...] pixi-cache=... uv-cache=... envs=...` heartbeat every 60s
+  there instead: growing sizes mean it's working, not hung.
 - **Later boots** (~2 min): re-verifies installs (`hf download` resumes/no-ops
   in seconds) and starts ComfyUI.
 - **Pod moved to a different GPU generation** (e.g. volume shared between a
