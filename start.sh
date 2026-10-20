@@ -159,13 +159,18 @@ else
 fi
 echo "GPU compute capability: ${COMPUTE_CAP:-unknown} | TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST"
 
-# Caches on EPHEMERAL container disk (so they don't bloat the volume); built
-# envs and model weights on the VOLUME (so they survive restarts).
+# pixi/uv caches live ON THE VOLUME, beside the envs they fill: same
+# filesystem => rattler/uv HARDLINK package files into .ce/.pixi/envs/*
+# instead of falling back to full copies (the "Failed to hardlink" warning).
+# The node envs then share one torch/CUDA stack instead of one copy per env,
+# and the warm cache survives restarts: fresh containers and arch-change
+# rebuilds LINK instead of re-downloading ~14 GB. pip's cache stays ephemeral
+# (it only serves the small venv-level installs).
 export PIP_CACHE_DIR=/root/.pip-cache
 export COMFY_ENV_ROOT=/workspace/.ce
-export PIXI_CACHE_DIR=/root/.pixi-cache
-export RATTLER_CACHE_DIR=/root/.pixi-cache
-export UV_CACHE_DIR=/root/.uv-cache
+export PIXI_CACHE_DIR=$COMFY_ENV_ROOT/pixi-cache
+export RATTLER_CACHE_DIR=$COMFY_ENV_ROOT/pixi-cache
+export UV_CACHE_DIR=$COMFY_ENV_ROOT/uv-cache
 export TMPDIR=/tmp
 export HF_HOME=/workspace/.cache/huggingface
 export MAX_JOBS=$(( $(nproc) > 8 ? 8 : $(nproc) ))
@@ -202,17 +207,35 @@ if [ -n "$COMPUTE_CAP" ] && [ -n "$BUILT_FOR" ] && [ "$BUILT_FOR" != "$COMPUTE_C
 fi
 
 # Persist env for manual shells (SSH/Jupyter) so a manual ComfyUI restart
-# reuses the volume envs instead of rebuilding on ephemeral disk.
-if ! grep -q "COMFY_ENV_ROOT" /root/.bashrc 2>/dev/null; then
+# reuses the volume envs instead of rebuilding on ephemeral disk. Guard on the
+# cache PATH (not just COMFY_ENV_ROOT) so pods whose .bashrc still carries the
+# old /root cache dirs get the corrected block appended (later exports win).
+if ! grep -q "/workspace/.ce/pixi-cache" /root/.bashrc 2>/dev/null; then
   {
     echo ""
-    echo "# StableGen RunPod template env"
+    echo "# StableGen RunPod template env (caches on the volume -> hardlink dedup)"
     echo "export COMFY_ENV_ROOT=/workspace/.ce"
     echo "export HF_HOME=/workspace/.cache/huggingface"
-    echo "export PIXI_CACHE_DIR=/root/.pixi-cache"
-    echo "export RATTLER_CACHE_DIR=/root/.pixi-cache"
+    echo "export PIXI_CACHE_DIR=/workspace/.ce/pixi-cache"
+    echo "export RATTLER_CACHE_DIR=/workspace/.ce/pixi-cache"
+    echo "export UV_CACHE_DIR=/workspace/.ce/uv-cache"
     echo "export TORCH_CUDA_ARCH_LIST=\"$TORCH_CUDA_ARCH_LIST\""
   } >> /root/.bashrc
+fi
+
+# ---------------------------------------------------------------------------
+# Cache-layout migration: envs built before the pixi/uv caches moved onto the
+# volume hold full copies of every package (cross-filesystem hardlinking is
+# impossible). Wipe them ONCE so they rebuild hardlinked against the
+# on-volume cache. Gated on the installer actually running, so
+# STABLEGEN_SKIP_INSTALL=1 boots keep their (working) old-layout envs.
+# ---------------------------------------------------------------------------
+CACHE_LAYOUT_STAMP="$COMFY_ENV_ROOT/.cache-layout"
+if [ "${STABLEGEN_SKIP_INSTALL:-0}" != "1" ] \
+   && [ -d "$COMFY_ENV_ROOT/.pixi/envs" ] && [ ! -f "$CACHE_LAYOUT_STAMP" ]; then
+  echo "Cache layout change: rebuilding node envs hardlinked against $PIXI_CACHE_DIR..."
+  rm -rf "$COMFY_ENV_ROOT/.pixi"
+  rm -f "$COMFY_ENV_ROOT/install.hash"
 fi
 
 # --- Installer driver -------------------------------------------------------
@@ -384,15 +407,23 @@ if [ "${STABLEGEN_SKIP_MOTION:-0}" != "1" ]; then
   #                                                               is already present via ComfyUI-GGUF)
   #   Text2MotionPrompter        -> HF cache (prompt rewrite + duration estimate; auto-download fallback)
   #   VAST-AI/UniRig             -> HF cache (skeleton + skin ckpts; node's Load Model downloads on use)
+  #
+  # `hf download` NOTE (verified against huggingface_hub 1.33.0): --include
+  # takes ONE pattern per flag occurrence. A space-separated second pattern is
+  # parsed as a POSITIONAL filename and the --include value is dropped with a
+  # warning ("Ignoring `--include` since filenames have been explicitly set"):
+  # a positional like "skin/*" then 404s as a literal file (.../skin/%2A), and
+  # a positional without a wildcard silently narrows the download. Always
+  # REPEAT the flag: --include "a/*" --include "b/*".
   if [ "${STABLEGEN_SKIP_MODELS:-0}" != "1" ]; then
     if HF_BIN="$(hf_bin)"; then
       phase "Downloading/verifying motion weights (~18 GB first time)"
       "$HF_BIN" download tencent/HY-Motion-1.0 \
-        --include "HY-Motion-1.0/*" "HY-Motion-1.0-Lite/*" \
+        --include "HY-Motion-1.0/*" --include "HY-Motion-1.0-Lite/*" \
         --local-dir "$COMFYUI_PATH/models/HY-Motion/ckpts/tencent/" \
         || echo "WARN: HY-Motion ckpt prefetch failed; node will download on first use"
       "$HF_BIN" download openai/clip-vit-large-patch14 \
-        --include "*.json" "*.txt" "model.safetensors" \
+        --include "*.json" --include "*.txt" --include "model.safetensors" \
         --local-dir "$COMFYUI_PATH/models/HY-Motion/ckpts/clip-vit-large-patch14/" \
         || echo "WARN: CLIP prefetch failed; node will download on first use"
       "$HF_BIN" download Qwen/Qwen3-8B-GGUF Qwen3-8B-Q4_K_M.gguf \
@@ -403,7 +434,7 @@ if [ "${STABLEGEN_SKIP_MOTION:-0}" != "1" ]; then
         || echo "WARN: Text2MotionPrompter prefetch failed; node will download on first use"
       echo "Pre-fetching UniRig checkpoints into HF cache..."
       "$HF_BIN" download VAST-AI/UniRig \
-        --include "skeleton/*" "skin/*" \
+        --include "skeleton/*" --include "skin/*" \
         || echo "WARN: UniRig ckpt prefetch failed; Load Model node will download on first use"
     else
       echo "WARN: no hf/huggingface-cli CLI found (venv bin or PATH); skipping motion weight prefetch"
@@ -411,8 +442,10 @@ if [ "${STABLEGEN_SKIP_MOTION:-0}" != "1" ]; then
   fi
 fi
 
-# Stamp the arch AFTER installs so a failed install retries on next boot.
+# Stamp the arch + cache layout AFTER installs so a failed install retries on
+# the next boot (stamps are only written once everything above succeeded).
 [ -n "$COMPUTE_CAP" ] && echo "$COMPUTE_CAP" > "$ARCH_STAMP"
+echo "hardlink-v1" > "$CACHE_LAYOUT_STAMP"
 
 echo "=== Setup complete ($(date -u +%FT%TZ), $((SECONDS - BOOT_SECONDS))s since boot start); starting ComfyUI via RunPod /start-runpod.sh ==="
 exec /start-runpod.sh
