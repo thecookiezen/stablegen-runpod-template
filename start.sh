@@ -105,9 +105,11 @@ if [ -f /opt/comfyui-runtime-constraints.txt ]; then
 fi
 
 # --- Python: the cu128 venv, then system python ------------------------------
+# NOTE: keep pip invocations as "$PY" -m pip ... — packing "$PY -m pip" into a
+# single quoted variable makes bash treat it as one command name and every
+# call dies with "No such file or directory".
 PY="$VENV_DIR/bin/python"
 [ -x "$PY" ] || PY="$(command -v python3)"
-PIP="$PY -m pip"
 echo "Using python: $PY ($("$PY" --version 2>&1))"
 
 # ---------------------------------------------------------------------------
@@ -201,10 +203,10 @@ if [ "${STABLEGEN_SKIP_INSTALL:-0}" != "1" ]; then
   HUB_REQ="$(hub_pin)"
   if [ -n "$HUB_REQ" ]; then
     echo "Pinning ${HUB_REQ} (range required by the image's transformers)"
-    "$PIP" install -q "$HUB_REQ" requests tqdm \
+    "$PY" -m pip install -q "$HUB_REQ" requests tqdm \
       || echo "WARN: failed to pin huggingface-hub / install driver deps"
   else
-    "$PIP" install -q requests tqdm || true
+    "$PY" -m pip install -q requests tqdm || true
   fi
 
   if "$PY" /opt/stablegen-template/stablegen_install.py "$COMFYUI_PATH"; then
@@ -224,7 +226,7 @@ fi
 if ! "$PY" -c "import transformers" >/dev/null 2>&1; then
   HUB_REQ="$(hub_pin)"
   echo "WARN: transformers import failed -> re-pinning huggingface-hub into range"
-  [ -n "$HUB_REQ" ] && "$PIP" install "$HUB_REQ"
+  [ -n "$HUB_REQ" ] && "$PY" -m pip install "$HUB_REQ"
   "$PY" -c "import transformers" \
     || echo "ERROR: transformers still broken; nodes using it will fail to load"
 fi

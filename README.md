@@ -220,6 +220,15 @@ plus corrections for how the current ComfyUI-TRELLIS2 actually behaves:
   hard-required <2.0). The pin goes on before installs and is re-applied
   after if `import transformers` fails, because hub drifting out of range is
   what crashes ComfyUI at import.
+- `comfy-env` is pinned to the version the pinned `ComfyUI-TRELLIS2` commit
+  declares in its `requirements.txt` (currently `0.3.89`; override with
+  `STABLEGEN_COMFY_ENV_PIN`). The installer driver routes every comfy-env
+  install — including its own retry/reinstall paths — through that pin and
+  restores it after the node's `install.py` ran. Unversioned installs pull
+  comfy-env 0.4.x, whose stricter root-config schema rejects the node's
+  `comfy-env-root.toml` (`[cuda]`/`[node_reqs]`), which both fails
+  `install.py` and makes ComfyUI drop the node at import with
+  `RuntimeError: the root config exists but could not be read`.
 - Compiled envs persist in `COMFY_ENV_ROOT=/workspace/.ce`; pip/pixi/uv caches
   go to ephemeral container disk so the volume stays lean.
 - The base image's own upgrade logic (`.runpod-bundle-version` manifest)
