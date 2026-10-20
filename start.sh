@@ -40,7 +40,15 @@
 #                           checkpoint_realvis qwen_core trellis2)
 #   STABLEGEN_SKIP_INSTALL  set to 1 to skip the installer driver entirely
 #   STABLEGEN_SKIP_MODELS   set to 1 to skip the TRELLIS.2 weight prefetch
+#   STABLEGEN_SKIP_MOTION   set to 1 to skip the text-to-animation add-on
+#                           (ComfyUI-HY-Motion1 + ComfyUI-UniRig nodes, their
+#                           deps/envs and the HY-Motion/UniRig weight prefetch)
 # =============================================================================
+
+# Section header with a UTC timestamp: makes every boot log self-profiling
+# (how long the copy / installer / downloads / env builds each took).
+phase() { echo "=== $* [$(date -u +%H:%M:%SZ)] ==="; }
+BOOT_SECONDS=$SECONDS
 
 echo "=== StableGen RunPod template: boot start ($(date -u +%FT%TZ)) ==="
 
@@ -58,7 +66,7 @@ COMFYUI_PATH="/workspace/runpod-slim/ComfyUI"
 # --- Self-heal: populate /workspace from the image's baked copy -------------
 if [ ! -f "$COMFYUI_PATH/main.py" ]; then
   if [ -d /opt/comfyui-baked ]; then
-    echo "First boot: copying baked ComfyUI (incl. StableGen nodes) to workspace..."
+    phase "First boot: copying baked ComfyUI (incl. StableGen nodes) to workspace"
     rm -rf "$COMFYUI_PATH"
     mkdir -p "$(dirname "$COMFYUI_PATH")"
     cp -a /opt/comfyui-baked "$COMFYUI_PATH"
@@ -84,12 +92,16 @@ if [ ! -x "$VENV_DIR/bin/python" ]; then
   echo "Creating cu128 venv (system-site-packages)..."
   python3.12 -m venv --system-site-packages "$VENV_DIR"
   "$VENV_DIR/bin/python" -m ensurepip >/dev/null 2>&1 || true
+  # ensurepip bundles an old pip (24.x on Python 3.12); a current one avoids
+  # old-resolver/metadata quirks in the constrained node installs. Runs once
+  # per fresh venv only.
+  "$VENV_DIR/bin/python" -m pip install -q --upgrade pip >/dev/null 2>&1 || true
 fi
 
 # --- Sync image-baked StableGen nodes into the workspace (offline-first) ----
 # Nodes deleted from the workspace are restored from the image without
 # touching GitHub. Existing (possibly newer, Manager-updated) nodes win.
-for node in ComfyUI_IPAdapter_plus ComfyUI-GGUF ComfyUI-TRELLIS2 ComfyUI-Marigold ComfyUI_StableDelight_ll; do
+for node in ComfyUI_IPAdapter_plus ComfyUI-GGUF ComfyUI-TRELLIS2 ComfyUI-Marigold ComfyUI_StableDelight_ll ComfyUI-HY-Motion1 ComfyUI-UniRig; do
   if [ -d "/opt/comfyui-baked/custom_nodes/$node" ] && [ ! -d "$COMFYUI_PATH/custom_nodes/$node" ]; then
     echo "Restoring baked node: $node"
     cp -a "/opt/comfyui-baked/custom_nodes/$node" "$COMFYUI_PATH/custom_nodes/$node"
@@ -111,6 +123,21 @@ fi
 PY="$VENV_DIR/bin/python"
 [ -x "$PY" ] || PY="$(command -v python3)"
 echo "Using python: $PY ($("$PY" --version 2>&1))"
+
+# Locate the HuggingFace CLI. venv-local first (in case hub was installed
+# into the venv), then PATH: with --system-site-packages the pin step usually
+# resolves hub from system dist-packages as "already satisfied", so the entry
+# points land in /usr/local/bin -- NOT next to the venv python. Without the
+# PATH fallback every weight prefetch would silently skip.
+hf_bin() {
+  local b
+  for b in "$(dirname "$PY")/hf" "$(dirname "$PY")/huggingface-cli" \
+           "$(command -v hf 2>/dev/null || true)" \
+           "$(command -v huggingface-cli 2>/dev/null || true)"; do
+    [ -n "$b" ] && [ -x "$b" ] && { echo "$b"; return 0; }
+  done
+  return 1
+}
 
 # ---------------------------------------------------------------------------
 # GPU arch detection. The compiled CUDA extensions (trellis2/geometrypack)
@@ -156,7 +183,7 @@ if [ -n "$COMPUTE_CAP" ] && [ -n "$BUILT_FOR" ] && [ "$BUILT_FOR" != "$COMPUTE_C
   echo "GPU ARCH CHANGED: envs built for sm_${BUILT_FOR} but this pod is sm_${COMPUTE_CAP}"
   echo "Wiping compiled envs so CUDA extensions rebuild for this GPU..."
   rm -rf "$COMFY_ENV_ROOT/.pixi"
-  for repo in ComfyUI-TRELLIS2 ComfyUI-GeometryPack; do
+  for repo in ComfyUI-TRELLIS2; do
     # old comfy-env layout: per-repo _env_* dirs
     find "$COMFYUI_PATH/custom_nodes/$repo" -maxdepth 1 -type d -name "_env_*" \
       -exec rm -rf {} + 2>/dev/null
@@ -199,7 +226,7 @@ for r in (m.requires("transformers") or []):
 EOF
 }
 if [ "${STABLEGEN_SKIP_INSTALL:-0}" != "1" ]; then
-  echo "=== Installing StableGen components (nodes + models) ==="
+  phase "Installing StableGen components (nodes + models)"
   HUB_REQ="$(hub_pin)"
   if [ -n "$HUB_REQ" ]; then
     echo "Pinning ${HUB_REQ} (range required by the image's transformers)"
@@ -246,10 +273,8 @@ done
 #                                  public mirror, so no HF_TOKEN needed)
 #   ZhengPeng7/BiRefNet         -> HF cache (loaded via from_pretrained)
 if [ "${STABLEGEN_SKIP_MODELS:-0}" != "1" ]; then
-  HF_BIN="$(dirname "$PY")/hf"
-  [ -x "$HF_BIN" ] || HF_BIN="$(dirname "$PY")/huggingface-cli"
-  if [ -x "$HF_BIN" ]; then
-    echo "=== Downloading/verifying TRELLIS.2 weights (~15.4 GB first time) ==="
+  if HF_BIN="$(hf_bin)"; then
+    phase "Downloading/verifying TRELLIS.2 weights (~15.4 GB first time)"
     "$HF_BIN" download microsoft/TRELLIS.2-4B \
       --local-dir "$COMFYUI_PATH/models/trellis2/" \
       || echo "WARN: TRELLIS.2-4B prefetch failed; node will download on first use"
@@ -261,14 +286,104 @@ if [ "${STABLEGEN_SKIP_MODELS:-0}" != "1" ]; then
       --local-dir "$COMFYUI_PATH/models/dinov3/" \
       || echo "WARN: DinoV3 prefetch failed; node will download on first use"
   else
-    echo "WARN: hf CLI not found next to $PY; skipping weight prefetch"
+    echo "WARN: no hf/huggingface-cli CLI found (venv bin or PATH); skipping weight prefetch"
   fi
 else
   echo "STABLEGEN_SKIP_MODELS=1 -> skipping weight prefetch"
 fi
 
+# ---------------------------------------------------------------------------
+# Motion add-on: text-to-animation + auto-rigging.
+#
+#   ComfyUI-HY-Motion1 (jtydhr88) - HY-Motion 1.0 (Tencent Hunyuan): text ->
+#     skeletal human motion, exports GLB (skeleton animation) / FBX / NPZ.
+#   ComfyUI-UniRig (PozzettiAndrea) - UniRig + Make-It-Animatable: skeleton +
+#     skin weights for arbitrary meshes (e.g. TRELLIS.2 output), pose
+#     manipulation, apply-animation.
+#
+# Runs AFTER the installer driver so it inherits the settled comfy-env pin.
+# Neither node is part of StableGen's installer tags; this section owns them.
+#
+# comfy-env note: UniRig's requirements.txt asks for comfy-env==0.4.1, but its
+# comfy-env-root.toml uses the same 0.3 schema ([node_reqs]/[cuda]) as
+# TRELLIS2's, so its install.py is run under the existing 0.3.x pin and the
+# pin line is stripped from its venv requirements. Do NOT let anything upgrade
+# comfy-env past 0.4.25 (schema hard-reject; see installer driver notes).
+#
+# Nothing here is fatal: every step warns and continues.
+# ---------------------------------------------------------------------------
+if [ "${STABLEGEN_SKIP_MOTION:-0}" != "1" ]; then
+  phase "Motion add-on: ComfyUI-HY-Motion1 (text-to-motion) + ComfyUI-UniRig (auto-rig)"
+
+  # --- ComfyUI-HY-Motion1: venv-level deps ---------------------------------
+  # Pure-Python (torch is protected by PIP_CONSTRAINT). fbxsdkpy (optional,
+  # FBX export only - GLB export needs nothing extra) lives on an extra index
+  # and is attempted separately so a failure cannot break the rest.
+  HYMOTION_NODE="$COMFYUI_PATH/custom_nodes/ComfyUI-HY-Motion1"
+  if [ -d "$HYMOTION_NODE" ]; then
+    grep -vE '^(--extra-index-url|fbxsdkpy)' "$HYMOTION_NODE/requirements.txt" \
+      > /tmp/hymotion-reqs.txt || true
+    "$PY" -m pip install -q -r /tmp/hymotion-reqs.txt \
+      || echo "WARN: HY-Motion pip requirements failed (node may still work)"
+    "$PY" -m pip install -q fbxsdkpy \
+      --extra-index-url https://gitlab.inria.fr/api/v4/projects/18692/packages/pypi/simple \
+      || echo "NOTE: fbxsdkpy not installable -> HY-Motion FBX export disabled (GLB/NPZ export unaffected)"
+  else
+    echo "WARN: $HYMOTION_NODE missing; skipping its deps"
+  fi
+
+  # --- ComfyUI-UniRig: venv deps (minus the comfy-env pin) + isolated env --
+  UNIRIG_NODE="$COMFYUI_PATH/custom_nodes/ComfyUI-UniRig"
+  if [ -d "$UNIRIG_NODE" ]; then
+    grep -viE '^\s*comfy-env' "$UNIRIG_NODE/requirements.txt" \
+      > /tmp/unirig-reqs.txt || true
+    "$PY" -m pip install -q -r /tmp/unirig-reqs.txt \
+      || echo "WARN: UniRig venv requirements failed (node may still work)"
+    echo "Building/verifying UniRig isolated env (comfy-env/pixi; first build takes a while)..."
+    ( cd "$UNIRIG_NODE" && "$PY" install.py ) \
+      || echo "WARN: UniRig install.py failed. Re-run once ComfyUI is up:" \
+           "cd $UNIRIG_NODE && $PY install.py"
+  else
+    echo "WARN: $UNIRIG_NODE missing; skipping its install"
+  fi
+
+  # --- Motion weights -------------------------------------------------------
+  # Layouts the nodes expect (see ComfyUI-HY-Motion1 README / nodes.py):
+  #   tencent/HY-Motion-1.0      -> models/HY-Motion/ckpts/tencent/{HY-Motion-1.0,HY-Motion-1.0-Lite}/
+  #   openai/clip-vit-large-...  -> models/HY-Motion/ckpts/clip-vit-large-patch14/   (text enc., CLIP side)
+  #   Qwen/Qwen3-8B-GGUF Q4_K_M  -> models/HY-Motion/ckpts/GGUF/  (low-VRAM LLM encoder; 'gguf' pip pkg
+  #                                                               is already present via ComfyUI-GGUF)
+  #   Text2MotionPrompter        -> HF cache (prompt rewrite + duration estimate; auto-download fallback)
+  #   VAST-AI/UniRig             -> HF cache (skeleton + skin ckpts; node's Load Model downloads on use)
+  if [ "${STABLEGEN_SKIP_MODELS:-0}" != "1" ]; then
+    if HF_BIN="$(hf_bin)"; then
+      phase "Downloading/verifying motion weights (~18 GB first time)"
+      "$HF_BIN" download tencent/HY-Motion-1.0 \
+        --include "HY-Motion-1.0/*" "HY-Motion-1.0-Lite/*" \
+        --local-dir "$COMFYUI_PATH/models/HY-Motion/ckpts/tencent/" \
+        || echo "WARN: HY-Motion ckpt prefetch failed; node will download on first use"
+      "$HF_BIN" download openai/clip-vit-large-patch14 \
+        --include "*.json" "*.txt" "model.safetensors" \
+        --local-dir "$COMFYUI_PATH/models/HY-Motion/ckpts/clip-vit-large-patch14/" \
+        || echo "WARN: CLIP prefetch failed; node will download on first use"
+      "$HF_BIN" download Qwen/Qwen3-8B-GGUF Qwen3-8B-Q4_K_M.gguf \
+        --local-dir "$COMFYUI_PATH/models/HY-Motion/ckpts/GGUF/" \
+        || echo "WARN: Qwen3 GGUF prefetch failed; use the transformers LLM loader instead"
+      echo "Pre-fetching Text2MotionPrompter into HF cache..."
+      "$HF_BIN" download Text2MotionPrompter/Text2MotionPrompter \
+        || echo "WARN: Text2MotionPrompter prefetch failed; node will download on first use"
+      echo "Pre-fetching UniRig checkpoints into HF cache..."
+      "$HF_BIN" download VAST-AI/UniRig \
+        --include "skeleton/*" "skin/*" \
+        || echo "WARN: UniRig ckpt prefetch failed; Load Model node will download on first use"
+    else
+      echo "WARN: no hf/huggingface-cli CLI found (venv bin or PATH); skipping motion weight prefetch"
+    fi
+  fi
+fi
+
 # Stamp the arch AFTER installs so a failed install retries on next boot.
 [ -n "$COMPUTE_CAP" ] && echo "$COMPUTE_CAP" > "$ARCH_STAMP"
 
-echo "=== Setup complete ($(date -u +%FT%TZ)); starting ComfyUI via RunPod /start-runpod.sh ==="
+echo "=== Setup complete ($(date -u +%FT%TZ), $((SECONDS - BOOT_SECONDS))s since boot start); starting ComfyUI via RunPod /start-runpod.sh ==="
 exec /start-runpod.sh

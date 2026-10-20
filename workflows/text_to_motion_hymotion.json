@@ -1,0 +1,63 @@
+{
+  "1": {
+    "inputs": {
+      "gguf_file": "Qwen3-8B-Q4_K_M.gguf",
+      "device_strategy": "gpu"
+    },
+    "class_type": "HYMotionLoadLLMGGUF",
+    "_meta": { "title": "Load Qwen3-8B GGUF (motion text encoder)" }
+  },
+  "2": {
+    "inputs": {
+      "model_name": "HY-Motion-1.0"
+    },
+    "class_type": "HYMotionLoadNetwork",
+    "_meta": { "title": "Load HY-Motion network (use -Lite on 24 GB GPUs)" }
+  },
+  "3": {
+    "inputs": {
+      "llm": ["1", 0],
+      "text": "a person runs forward, then jumps over an obstacle"
+    },
+    "class_type": "HYMotionEncodeText",
+    "_meta": { "title": "Motion description (English, under 60 words)" }
+  },
+  "4": {
+    "inputs": {
+      "network": ["2", 0],
+      "conditioning": ["3", 0],
+      "duration": 4.0,
+      "seed": 42,
+      "cfg_scale": 5.0,
+      "num_samples": 1
+    },
+    "class_type": "HYMotionGenerate",
+    "_meta": { "title": "Generate motion" }
+  },
+  "5": {
+    "inputs": {
+      "motion_data": ["4", 0],
+      "output_dir": "hymotion",
+      "filename_prefix": "run_jump"
+    },
+    "class_type": "HYMotionSaveNPZ",
+    "_meta": { "title": "Save NPZ (SMPL-H motion data)" }
+  },
+  "6": {
+    "inputs": {
+      "motion_data": ["4", 0],
+      "sample_index": 0,
+      "frame_step": 5,
+      "image_size": 512
+    },
+    "class_type": "HYMotionPreview",
+    "_meta": { "title": "Skeleton preview frames" }
+  },
+  "7": {
+    "inputs": {
+      "images": ["6", 0]
+    },
+    "class_type": "PreviewImage",
+    "_meta": { "title": "Preview skeleton frames" }
+  }
+}

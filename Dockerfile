@@ -41,6 +41,11 @@ ARG GGUF_REF=6ea2651e7df66d7585f6ffee804b20e92fb38b8a
 ARG MARIGOLD_REF=2adfec75c430b0751a98a82453dc2dd8077bca85
 ARG STABLEDELIGHT_REF=42c0463cc65554509804cbf577a1675c61499ec4
 
+# Motion add-on (text-to-animation + auto-rigging; installed by start.sh, not
+# StableGen's installer). Same *_REF override mechanics as the nodes above.
+ARG HYMOTION_REF=60843a4d631efa3989b5c512ae547f996c30dcc3
+ARG UNIRIG_REF=69ee59dc459d2da7cb0291930c1f944886c31d7c
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Fail the build early if RunPod changes the baked layout in a future tag.
@@ -132,7 +137,26 @@ RUN set -eux; \
     clone ComfyUI-GGUF             https://github.com/city96/ComfyUI-GGUF.git              "${GGUF_REF}"; \
     clone ComfyUI-TRELLIS2         https://github.com/PozzettiAndrea/ComfyUI-TRELLIS2.git  "${TRELLIS2_REF}"; \
     clone ComfyUI-Marigold         https://github.com/kijai/ComfyUI-Marigold.git            "${MARIGOLD_REF}"; \
-    clone ComfyUI_StableDelight_ll https://github.com/lldacing/ComfyUI_StableDelight_ll.git "${STABLEDELIGHT_REF}"
+    clone ComfyUI_StableDelight_ll https://github.com/lldacing/ComfyUI_StableDelight_ll.git "${STABLEDELIGHT_REF}"; \
+    clone ComfyUI-HY-Motion1       https://github.com/jtydhr88/ComfyUI-HY-Motion1.git      "${HYMOTION_REF}"; \
+    clone ComfyUI-UniRig           https://github.com/PozzettiAndrea/ComfyUI-UniRig.git    "${UNIRIG_REF}"
+
+# Bake the installer driver's own deps into SYSTEM site-packages: comfy-env
+# at the pinned schema version the nodes need (derived from the cloned
+# TRELLIS2's requirements.txt -- same source of truth as
+# stablegen_install.py, which falls back to 0.3.89), plus requests/tqdm.
+# The runtime venv is --system-site-packages, so a first boot can run the
+# driver (incl. its comfy-env patches) with no PyPI round-trips. The
+# driver's pin/heal logic still overrides this if a node ever needs a
+# different comfy-env version.
+RUN set -eux; \
+    pin="$(sed -n 's/^[[:space:]]*comfy-env[[:space:]]*==[[:space:]]*//p' \
+      /opt/comfyui-baked/custom_nodes/ComfyUI-TRELLIS2/requirements.txt \
+      | head -1 | cut -d' ' -f1)"; \
+    pin="${pin:-0.3.89}"; \
+    echo "Baking comfy-env==${pin} (from TRELLIS2 requirements.txt) + driver deps"; \
+    pip install --no-cache-dir --constraint /opt/comfyui-runtime-constraints.txt \
+      "comfy-env==${pin}" requests tqdm
 
 # Take over the container entrypoint. The base image uses
 # ENTRYPOINT ["/start.sh"], so a RunPod template "start command" would only
@@ -157,6 +181,24 @@ RUN { \
       done; \
     } > /opt/stablegen-template/BUILD_INFO \
  && cat /opt/stablegen-template/BUILD_INFO
+
+# Canary: RunPod's rc builds sometimes ship a .runpod-bundle-version whose
+# managed-node SHAs do not match the commits actually baked (observed on
+# 1.5.0-rc.181: BUILD_INFO said 9c2c1726/d3f712f2/a0dccf63 while the manifest
+# claimed 555e984b/57105374/9e32b1a0). Their upgrade logic compares the
+# manifest against itself, so it stays self-consistent -- but surface the
+# divergence at BUILD time so anyone comparing BUILD_INFO with the manifest
+# knows the manifest is the stale side. Informational only, never fails.
+RUN set -eux; \
+    manifest=/opt/comfyui-baked/.runpod-bundle-version; \
+    for pair in ComfyUI-KJNodes:KJNODES_SHA Civicomfy:CIVICOMFY_SHA ComfyUI-RunpodDirect:RUNPODDIRECT_SHA; do \
+      dir=${pair%%:*}; key=${pair##*:}; \
+      want="$(sed -n "s/^${key}=//p" "$manifest" | head -1 | tr -d '[:space:]')"; \
+      have="$(git -C "/opt/comfyui-baked/custom_nodes/$dir" rev-parse HEAD 2>/dev/null || true)"; \
+      if [ -n "$want" ] && [ -n "$have" ] && [ "${have#"$want"}" = "$have" ]; then \
+        echo "NOTE: manifest ${key}=${want} but baked commit is ${have} (RunPod image quirk; informational)." >&2; \
+      fi; \
+    done
 
 # Match the boot script's persistent paths in manual shells (SSH / Jupyter).
 ENV COMFY_ENV_ROOT=/workspace/.ce \

@@ -3,8 +3,11 @@
 A self-contained RunPod template for the [StableGen](https://github.com/sakalond/StableGen)
 Blender addon backend: ComfyUI plus every custom node and model StableGen needs
 for SDXL texturing, Qwen Image Edit texturing, PBR decomposition, and TRELLIS.2
-image/text-to-3D. You own the image and the boot script, so nothing goes stale
-behind your back.
+image/text-to-3D — **plus a text-to-animation add-on**: HY-Motion 1.0
+(text → skeletal motion, e.g. "jump", "run", "throw") and UniRig (auto-rigging
+skeleton + skin weights for generated meshes), with GLB/FBX output that drops
+straight into Blender/Unity. You own the image and the boot script, so nothing
+goes stale behind your back.
 
 ## What gets installed
 
@@ -15,6 +18,7 @@ pay the setup cost once. Later boots verify and launch in a couple of minutes.
 |---|---|---|
 | ComfyUI v0.41.1 (upstream release on the RunPod image runtime, with JupyterLab + Manager) | `/workspace/runpod-slim/ComfyUI` | in image |
 | Custom nodes: IPAdapter Plus, GGUF, TRELLIS2, Marigold, StableDelight | `ComfyUI/custom_nodes/` | in image |
+| Custom nodes: HY-Motion1 (text-to-motion), UniRig (auto-rig) | `ComfyUI/custom_nodes/` | in image |
 | SDXL stack: IPAdapter + CLIP vision models, ControlNets (depth + union + alt), Lightning/Hyper LoRAs | `ComfyUI/models/...` | ~14 GB |
 | RealVisXL V5.0 fp16 checkpoint (ready-to-use SDXL base) | `ComfyUI/models/checkpoints/` | ~6.5 GB |
 | Qwen Image Edit 2509: GGUF UNet (Q3_K_M), VAE, text encoder, Lightning LoRA | `ComfyUI/models/...` | ~20 GB |
@@ -22,10 +26,15 @@ pay the setup cost once. Later boots verify and launch in a couple of minutes.
 | DinoV3 encoder (public mirror, no token needed) | `ComfyUI/models/dinov3/` | ~1.3 GB |
 | BiRefNet (background removal) | HF cache on volume | ~1 GB |
 | StableDelight (yoso-delight) diffusers model | `ComfyUI/models/diffusers/` | ~3.3 GB |
-| Compiled comfy-env/pixi environments for TRELLIS2 | `/workspace/.ce` | ~5 GB |
+| HY-Motion 1.0 + Lite motion models | `ComfyUI/models/HY-Motion/ckpts/tencent/` | ~6.1 GB |
+| Qwen3-8B Q4_K_M GGUF (HY-Motion text encoder) + CLIP ViT-L/14 | `ComfyUI/models/HY-Motion/ckpts/` | ~6.7 GB |
+| Text2MotionPrompter (prompt rewrite + duration estimate) | HF cache on volume | ~2-3 GB |
+| UniRig skeleton + skinning checkpoints | HF cache on volume | ~3 GB |
+| Compiled comfy-env/pixi environments for TRELLIS2 + UniRig | `/workspace/.ce` | ~5+ GB |
 
-Total first-boot download: roughly **60-65 GB** (volume speed dependent, expect
-30-90 min) plus 10-20 min of CUDA compilation for the TRELLIS2 node the first
+Total first-boot download: roughly **80-85 GB** (volume speed dependent, expect
+40-120 min) plus 10-20 min of CUDA compilation for the TRELLIS2 node and a
+UniRig env build (prebuilt conda packages, minutes not hours) the first
 time. Nothing in the default set is gated: no HuggingFace token required.
 
 ## Repo layout
@@ -37,6 +46,7 @@ stablegen-runpod-template/
 ├── start.sh              # boot script; installed as the image's /start.sh entrypoint
 ├── stablegen_install.py  # headless driver for StableGen's installer.py
 ├── build_and_push.sh     # local build helper
+├── workflows/            # ready-to-run ComfyUI workflows (API format)
 └── README.md
 ```
 
@@ -46,7 +56,14 @@ The image bakes in:
 - `/start.sh` - our boot script, installed as the image entrypoint
 - `/opt/stablegen-template/` - `stablegen_install.py` (the headless driver) and `BUILD_INFO`
 - `/start-runpod.sh` - RunPod's original launcher, exec'd at the end of our `/start.sh`
-- `/opt/comfyui-baked/custom_nodes/` - the five custom node repos, pre-cloned
+- `/opt/comfyui-baked/custom_nodes/` - the seven custom node repos (five
+  StableGen + HY-Motion1 + UniRig), pre-cloned
+- The installer driver's own deps (`comfy-env` at the pinned schema version
+  derived from TRELLIS2's requirements.txt, plus `requests` and `tqdm`) in
+  system site-packages, so the first boot's driver run needs no PyPI
+  round-trips — the runtime venv sees them via `--system-site-packages`, and
+  the driver's pin/heal logic still overrides them when a node needs a
+  different version
 
 The Docker build needs **no GPU**: everything GPU-specific (CUDA extension
 compilation) and every model download happens at first pod boot, because that
@@ -107,7 +124,8 @@ One-time repo setup (Settings -> Secrets and variables -> Actions):
    and ignores extra arguments, so a template start command would silently
    never run. (This is exactly why cmd-override setups on this image go stale.)
 4. **Container Disk**: 30 GB (headroom for compile jobs; caches live here).
-5. **Volume**: mount a network volume at `/workspace`, 100 GB or more.
+5. **Volume**: mount a network volume at `/workspace`, **150 GB** or more
+   (first boot alone writes ~85 GB incl. model weights and compiled envs).
 6. **Expose HTTP ports** [8188](ComfyUI), [8888](JupyterLab) and [8080](FileBrowser); TCP [22](SSH). Connect Blender
    to the pod's 8188 proxy URL (or `IP:8188`) as the StableGen server address.
 
@@ -119,12 +137,14 @@ Optional template env vars:
 | `STABLEGEN_TAGS` | Replace the installer package list, e.g. `core preset_essentials checkpoint_realvis trellis2` to skip Qwen. Valid tags: `core preset_essentials extended_optional pbr_marigold pbr_stabledelight checkpoint_realvis qwen_core qwen_extras qwen_nunchaku trellis2 flux2_klein` |
 | `STABLEGEN_SKIP_INSTALL=1` | Skip node/model installation entirely (quick boot, debug only). |
 | `STABLEGEN_SKIP_MODELS=1` | Skip the TRELLIS.2/DinoV3/BiRefNet weight prefetch. |
+| `STABLEGEN_SKIP_MOTION=1` | Skip the text-to-animation add-on (HY-Motion + UniRig nodes, deps, envs and weights). |
 
 ## First boot vs. later boots
 
-- **First boot** (60-90 min): copies ComfyUI to the volume, applies StableGen's
+- **First boot** (60-120 min): copies ComfyUI to the volume, applies StableGen's
   compat patches, runs the TRELLIS2 installer (compiles CUDA kernels for your
-  GPU), downloads all models. Progress is visible in the pod logs.
+  GPU), builds the UniRig env, downloads all models (~80 GB). Progress is
+  visible in the pod logs.
 - **Later boots** (~2 min): re-verifies installs (`hf download` resumes/no-ops
   in seconds) and starts ComfyUI.
 - **Pod moved to a different GPU generation** (e.g. volume shared between a
@@ -140,7 +160,8 @@ Optional template env vars:
 - **Update everything to a new image**: rebuild + push the image, update the
   template, restart the pod. The ComfyUI core upgrades in place via the
   bundle-manifest mechanism (see above); models, compiled envs, and HF cache
-  on the volume are reused. The five StableGen nodes are user-owned and are
+  on the volume are reused. The five StableGen nodes plus the two motion
+  nodes are user-owned and are
   NOT refreshed by that path: either update them via ComfyUI-Manager, or
   delete `/workspace/runpod-slim/ComfyUI` before restarting so the new baked
   copy (with updated node pins) is copied in.
@@ -175,17 +196,25 @@ Everything is deliberately **pinned**:
   `/opt/comfyui-runtime-constraints.txt` (torch pins). The boot script exports
   `PIP_CONSTRAINT` from the latter so no later `pip install` can disturb the
   CUDA-matched torch stack.
+- The build prints a canary note when the base image's
+  `.runpod-bundle-version` manifest SHAs disagree with the commits actually
+  baked for the three managed nodes (observed on rc tags like
+  1.5.0-rc.181). RunPod's upgrade logic compares the manifest against itself
+  and stays self-consistent, but BUILD_INFO and the manifest then report
+  different node versions — good to know when debugging node states.
 - **Updating an existing pod**: the override appends a line to
   `.runpod-bundle-version`, so on the next boot the base image's own upgrade
   logic rsyncs the new core over `/workspace/runpod-slim/ComfyUI` (models,
   user data, and custom nodes are excluded; the three managed nodes are
-  refreshed; StableGen's five nodes are treated as user-owned and left
+  refreshed; StableGen's five nodes and the two motion nodes are treated as
+  user-owned and left
   alone). Nothing to do manually.
 
 ## Custom node pins
 
-The five StableGen node repos are cloned at exact commits (see the `*_REF`
-build args in the Dockerfile). The pins were chosen as follows:
+The five StableGen node repos are cloned at exact commits, as are the two
+motion add-on nodes (see the `*_REF` build args in the Dockerfile). The pins
+were chosen as follows:
 
 - `ComfyUI-TRELLIS2` `3e696f2` — the current node requires the post-March
   2026 layout: StableGen's addon workflows use `Trellis2ProcessMesh`, which
@@ -197,6 +226,18 @@ build args in the Dockerfile). The pins were chosen as follows:
   `ComfyUI_StableDelight_ll` — their latest commits; all register plain
   nodes against the stable custom-node API and are insensitive to the core
   version bump.
+- `ComfyUI-HY-Motion1` `60843a4` (v0.3.1) — text-to-motion on Tencent's
+  HY-Motion 1.0 (DiT + flow matching). Server-side GLB export (retarget onto
+  a Mixamo-rigged GLB via `pygltflib`, no FBX SDK needed), NPZ export, GGUF
+  text-encoder path via transformers (`gguf` is already present through
+  ComfyUI-GGUF). `fbxsdkpy` (FBX export only) is attempted from its extra
+  index but optional; a failure disables only the FBX node.
+- `ComfyUI-UniRig` `69ee59d` — by the same author as ComfyUI-TRELLIS2.
+  UniRig (skeleton + skinning, any mesh) + Make-It-Animatable (humanoids).
+  Despite its `requirements.txt` asking for `comfy-env==0.4.1`, its
+  `comfy-env-root.toml` uses the same 0.3 schema as TRELLIS2's, so its
+  `install.py` runs under the shared 0.3.89 pin (the boot script strips the
+  pin from its venv requirements).
 
 Rebuild with e.g. `TRELLIS2_REF=<sha> ./build_and_push.sh ...` to move a
 single node; the resolved SHAs of every build are printed and stored in
@@ -231,6 +272,13 @@ plus corrections for how the current ComfyUI-TRELLIS2 actually behaves:
   `RuntimeError: the root config exists but could not be read`.
 - Compiled envs persist in `COMFY_ENV_ROOT=/workspace/.ce`; pip/pixi/uv caches
   go to ephemeral container disk so the volume stays lean.
+- Weight prefetch finds the `hf` CLI next to the venv python or on `PATH`
+  (hub usually resolves from system site-packages, so its entry point lives
+  in `/usr/local/bin`, not in the venv's bin directory) — without the PATH
+  fallback, every prefetch would silently skip with only a WARN.
+- Every boot-log section header carries a UTC timestamp, and the final
+  "Setup complete" line reports total elapsed seconds, so slow phases are
+  identifiable directly from the pod log.
 - The base image's own upgrade logic (`.runpod-bundle-version` manifest)
   refreshes ComfyUI core and its managed nodes when you bump `BASE_TAG`,
   while treating the StableGen nodes as user-owned and leaving them alone.
@@ -242,6 +290,41 @@ plus corrections for how the current ComfyUI-TRELLIS2 actually behaves:
   so no gated-repo HF token dance is needed anymore.
 - WAS Node Suite and GeometryPack are gone: StableGen's Blender-driven
   workflows only use ComfyUI-TRELLIS2 nodes.
+- The motion add-on (HY-Motion + UniRig) is installed by the boot script
+  itself, after the StableGen installer driver, so it inherits the settled
+  `comfy-env` 0.3.x pin, `PIP_CONSTRAINT` torch protection and the
+  arch-stamp rebuild guard (UniRig's env lives in `/workspace/.ce` next to
+  TRELLIS2's). Every step warns and continues on failure — the pod boots
+  even if e.g. the `fbxsdkpy` index is unreachable. Do not let
+  ComfyUI-Manager "fix" UniRig by upgrading `comfy-env`: past 0.4.25 the
+  stricter root-config schema rejects TRELLIS2's and UniRig's
+  `comfy-env-root.toml` and breaks both nodes (and the installer re-pins it
+  back on the next boot anyway).
+
+## Text-to-motion and auto-rigging (Blender/Unity animations)
+
+The template ships HY-Motion 1.0 (text → skeletal human motion) and UniRig
+(skeleton + skinning for arbitrary meshes). Type "a person runs forward, then
+jumps over an obstacle" and get an animation you can drop into Blender/Unity.
+
+- **Ready-to-run workflow**: [`workflows/text_to_motion_hymotion.json`](workflows/)
+  (drag onto the ComfyUI canvas). The [workflows README](workflows/README.md)
+  has the full how-to: export routes (animated GLB / FBX / NPZ), retargeting
+  onto your own character, and all tuning knobs.
+- **Animate your own character**: `HYMotionExportGLB` bakes the motion onto a
+  Mixamo-rigged `.glb` you upload to `input/` — output imports into Blender
+  and Unity as-is. Rig a TRELLIS.2-generated human on mixamo.com (free,
+  humanoid) or fully on-pod with UniRig (works for animals/robots/props too).
+- **Auto-rig anything**: the `ComfyUI-UniRig` nodes (`Load Mesh` → `Auto Rig`
+  → `Apply Skinning` → `Save`) put a skeleton inside any generated mesh;
+  bundled workflow examples live in
+  `custom_nodes/ComfyUI-UniRig/workflows/` on the volume.
+- **VRAM**: HY-Motion 1.0 (1.0B) ≈ 8 GB + Qwen3-8B GGUF Q4 encoder ≈ 5 GB —
+  fits a 24 GB GPU; use `HY-Motion-1.0-Lite` (~4 GB) or `device_strategy=cpu`
+  for the encoder when sharing the GPU with TRELLIS.2/Qwen jobs. ComfyUI
+  swaps models between workflow runs, so the stacks coexist.
+- **Limits** (upstream model): humanoid single-person motions, English
+  prompts under ~60 words, no scene/camera descriptions, no seamless loops.
 
 ## Troubleshooting
 
@@ -257,6 +340,21 @@ plus corrections for how the current ComfyUI-TRELLIS2 actually behaves:
   `/workspace/runpod-slim/comfyui_args.txt`, JupyterLab on 8888, FileBrowser
   on 8080, SSH). If ComfyUI crashes, that script keeps the container alive so
   you can debug over SSH/Jupyter.
+- **HY-Motion/UniRig nodes missing**: check the pod logs for the
+  `Motion add-on` section; both nodes are restored from the image and
+  installed there. Re-run manually:
+  `cd /workspace/runpod-slim/ComfyUI/custom_nodes/ComfyUI-UniRig && \
+   /workspace/runpod-slim/ComfyUI/.venv-cu128/bin/python install.py`
+- **HY-Motion FBX export node fails**: `fbxsdkpy` (proprietary Autodesk FBX
+  SDK binding, extra index) did not install — check the boot log line. Use
+  the GLB export node or the 3D-viewer export instead; both import into
+  Blender and Unity without it.
+- **HY-Motion OOM on 24 GB**: switch `HYMotionLoadNetwork` to
+  `HY-Motion-1.0-Lite`, set `device_strategy` to `cpu` or `balanced` on the
+  GGUF loader, keep prompts under 30 words and clips under 5 s.
+- **First HY-Motion / UniRig generation is slow**: weights stream from the
+  volume on first use; UniRig's `Load Model` downloads/verifies checkpoints
+  into the HF cache once. Watch the pod logs; do not restart.
 
 ## Blender side
 
